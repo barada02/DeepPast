@@ -135,7 +135,7 @@ def run(args: argparse.Namespace) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Deep Past data-first preprocessing pipeline")
-    parser.add_argument("--input-dir", type=str, default="data/raw", help="Directory containing Kaggle CSV files")
+    parser.add_argument("--input-dir", type=str, default="data/deep_past_data", help="Directory containing Kaggle CSV files")
     parser.add_argument("--output-dir", type=str, default="data/processed", help="Directory for processed outputs")
     parser.add_argument("--valid-ratio", type=float, default=0.1, help="Validation ratio for deterministic split")
     parser.add_argument("--split-salt", type=str, default="deep_past_split_v1", help="Salt for deterministic split")
