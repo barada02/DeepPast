@@ -1,0 +1,55 @@
+/deep-past-data
+
+.env
+/venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+db.sqlite3
+*.log
+*.pot
+*.mo
+*.swp
+.DS_Store
+*.egg-info/
+dist/
+build/
+*.egg
+*.log
+*.bak
+*.tmp
+.idea/
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+# Ignore VS Code settings
+.vscode/
+# Ignore PyCharm settings
+.idea/
+# Ignore macOS system files
+.DS_Store
+# Ignore Windows system files
+Thumbs.db
+# Ignore log files
+*.log
+# Ignore virtual environment directories
+venv/
+env/
+# Ignore Python bytecode files
+__pycache__/
+*.pyc
+# Ignore database files
+db.sqlite3
+# Ignore coverage reports
+htmlcov/
+.coverage
+# Ignore test result files
+*.xml
+# Ignore compiled C extensions
+*.so
+# Ignore distribution files
+dist/
+build/
+*.egg-info/
