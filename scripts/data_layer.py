@@ -2,7 +2,9 @@
 
 This script intentionally implements only the two pipelines requested:
 1) Canonical text normalization on gold train pairs.
-2) Sentence-level preparation using train.csv + Sentences_Oare_FirstWord_LinNum.csv.
+2) Sentence-level source-target pair generation from:
+    - train.csv (document-level transliteration + translation)
+    - Sentences_Oare_FirstWord_LinNum.csv (sentence markers + sentence translations)
 
 It does NOT process test.csv or published_texts.csv in this version.
 """
@@ -90,6 +92,14 @@ def normalize_translation(text: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+def normalize_token_for_match(token: str) -> str:
+    """Normalize a single token for boundary matching checks."""
+    value = normalize_transliteration(token)
+    value = value.lower()
+    value = re.sub(r"[^a-z0-9šṣṭḫ\-]", "", value)
+    return value
+
+
 def deterministic_split_by_id(
     df: pd.DataFrame,
     id_col: str,
@@ -137,62 +147,110 @@ def build_canonical_train_pairs(train_df: pd.DataFrame, valid_ratio: float, spli
     return out
 
 
-def build_sentence_targets(
-    sentence_df: pd.DataFrame,
-    valid_ratio: float,
-    split_salt: str,
-) -> pd.DataFrame:
-    """Pipeline 2A: sentence target table from Sentences_Oare_FirstWord_LinNum.csv.
+def build_sentence_level_pairs(canonical_train_pairs: pd.DataFrame, sentence_df: pd.DataFrame) -> pd.DataFrame:
+    """Pipeline 2: build sentence-level source-target pairs.
 
-    Note: this file does not provide full source transliteration sentences.
-    It provides sentence-level English targets plus first-word/line anchors.
+    Strategy:
+    - join sentence-map rows to overlapping train documents (text_uuid == oare_id)
+    - use first_word_obj_in_text as sentence-start word index (1-based)
+    - slice transliteration_clean token stream between consecutive starts
+    - pair sliced source sentence with sentence translation from map file
     """
+    doc_cols = [c for c in ["oare_id", "transliteration", "transliteration_clean", "split"] if c in canonical_train_pairs.columns]
+    docs = canonical_train_pairs[doc_cols].copy().rename(columns={"oare_id": "text_uuid", "split": "doc_split"})
+
     work = sentence_df.copy()
     work["translation_clean"] = work["translation"].map(normalize_translation)
     work["first_word_transcription_clean"] = work["first_word_transcription"].map(normalize_transliteration)
+    work = work.merge(docs, on="text_uuid", how="inner")
 
-    sentence_id_col = "text_uuid" if "text_uuid" in work.columns else work.columns[0]
-    work = deterministic_split_by_id(work, sentence_id_col, valid_ratio, split_salt)
+    rows: list[dict] = []
+    for text_uuid, grp in work.groupby("text_uuid", sort=False):
+        grp_sorted = grp.sort_values(["first_word_obj_in_text", "sentence_obj_in_text"], kind="stable").reset_index(drop=True)
 
-    keep_cols = [
-        c
-        for c in [
-            "text_uuid",
-            "sentence_uuid",
-            "sentence_obj_in_text",
-            "line_number",
-            "first_word_transcription",
-            "first_word_transcription_clean",
-            "translation",
-            "translation_clean",
-            "split",
-        ]
-        if c in work.columns
-    ]
-    out = work[keep_cols].copy()
-    out["provenance"] = "gold_sentence_targets"
-    out["trust_weight"] = 1.0
-    return out
+        doc_translit_raw = str(grp_sorted.loc[0, "transliteration"])
+        doc_tokens_raw = doc_translit_raw.split()
+        doc_tokens_for_bounds = doc_tokens_raw
+        if not doc_tokens_for_bounds:
+            continue
 
+        doc_tokens_norm = [normalize_token_for_match(token) for token in doc_tokens_raw]
+        search_cursor = 0
+        starts: list[int] = []
+        start_method: list[str] = []
 
-def build_train_sentence_bridge(canonical_train_pairs: pd.DataFrame, sentence_targets: pd.DataFrame) -> pd.DataFrame:
-    """Pipeline 2B: bridge sentence targets to train document text (when ids match).
+        for row in grp_sorted.itertuples(index=False):
+            marker = normalize_token_for_match(getattr(row, "first_word_transcription_clean", ""))
+            found_idx = None
 
-    The merge uses text_uuid (sentence file) against oare_id (train file).
-    This creates a practical intermediate table for later alignment work.
-    """
-    train_bridge_cols = [
-        c
-        for c in ["oare_id", "transliteration", "transliteration_clean", "translation", "translation_clean", "split"]
-        if c in canonical_train_pairs.columns
-    ]
-    train_docs = canonical_train_pairs[train_bridge_cols].copy().rename(
-        columns={"oare_id": "text_uuid", "split": "doc_split"}
-    )
+            if marker:
+                for j in range(search_cursor, len(doc_tokens_norm)):
+                    token_norm = doc_tokens_norm[j]
+                    if token_norm == marker or token_norm.startswith(marker) or marker.startswith(token_norm):
+                        found_idx = j
+                        break
 
-    bridge = sentence_targets.merge(train_docs, on="text_uuid", how="left")
-    bridge["has_matching_train_doc"] = bridge["transliteration"].notna().astype(int)
-    return bridge
+            if found_idx is None:
+                fallback = pd.to_numeric(getattr(row, "first_word_obj_in_text", None), errors="coerce")
+                if pd.notna(fallback):
+                    fallback_idx = int(fallback) - 1
+                    if 0 <= fallback_idx < len(doc_tokens_norm):
+                        found_idx = fallback_idx
+                        start_method.append("first_word_obj_fallback")
+
+            if found_idx is None:
+                continue
+
+            starts.append(found_idx + 1)
+            if len(start_method) < len(starts):
+                start_method.append("marker_search")
+            search_cursor = max(search_cursor, found_idx)
+
+        if not starts:
+            continue
+
+        if len(starts) != len(grp_sorted):
+            grp_sorted = grp_sorted.iloc[: len(starts)].copy().reset_index(drop=True)
+
+        for i, row in enumerate(grp_sorted.itertuples(index=False)):
+            start_idx = starts[i] - 1
+            end_idx = starts[i + 1] - 1 if i + 1 < len(starts) else len(doc_tokens_for_bounds)
+            if start_idx >= end_idx:
+                continue
+
+            source_tokens_raw = doc_tokens_raw[start_idx:end_idx]
+            source_sentence_raw = " ".join(source_tokens_raw).strip()
+            source_sentence_clean = normalize_transliteration(source_sentence_raw)
+            if not source_sentence_clean:
+                continue
+
+            marker = normalize_token_for_match(getattr(row, "first_word_transcription_clean", ""))
+            source_first = normalize_token_for_match(source_tokens_raw[0]) if source_tokens_raw else ""
+            marker_match = int(bool(marker) and (source_first == marker or source_first.startswith(marker) or marker.startswith(source_first)))
+
+            rows.append(
+                {
+                    "text_uuid": text_uuid,
+                    "sentence_uuid": getattr(row, "sentence_uuid", ""),
+                    "sentence_obj_in_text": getattr(row, "sentence_obj_in_text", ""),
+                    "line_number": getattr(row, "line_number", ""),
+                    "source_sentence_raw": source_sentence_raw,
+                    "source_sentence_clean": source_sentence_clean,
+                    "target_sentence": getattr(row, "translation", ""),
+                    "target_sentence_clean": getattr(row, "translation_clean", ""),
+                    "source_start_word_idx": start_idx + 1,
+                    "source_end_word_idx_exclusive": end_idx + 1,
+                    "boundary_method": start_method[i],
+                    "first_word_transcription": getattr(row, "first_word_transcription", ""),
+                    "first_word_transcription_clean": getattr(row, "first_word_transcription_clean", ""),
+                    "first_word_match": marker_match,
+                    "split": getattr(row, "doc_split", "train"),
+                    "provenance": "gold_sentence_pair_from_markers",
+                    "trust_weight": 1.0,
+                }
+            )
+
+    return pd.DataFrame(rows)
 
 
 def run(args: argparse.Namespace) -> None:
@@ -213,20 +271,17 @@ def run(args: argparse.Namespace) -> None:
     sentence_df = pd.read_csv(sentence_path)
 
     canonical_train_pairs = build_canonical_train_pairs(train_df, args.valid_ratio, args.split_salt)
-    sentence_targets = build_sentence_targets(sentence_df, args.valid_ratio, args.split_salt)
-    sentence_bridge = build_train_sentence_bridge(canonical_train_pairs, sentence_targets)
+    sentence_level_pairs = build_sentence_level_pairs(canonical_train_pairs, sentence_df)
 
     canonical_train_pairs.to_csv(output_dir / "canonical_train_pairs.csv", index=False)
-    sentence_targets.to_csv(output_dir / "sentence_translation_targets.csv", index=False)
-    sentence_bridge.to_csv(output_dir / "train_sentence_bridge.csv", index=False)
+    sentence_level_pairs.to_csv(output_dir / "sentence_level_pairs.csv", index=False)
 
     print("Pipelines completed (minimal scope).")
     print(f"Input dir: {input_dir}")
     print(f"Output dir: {output_dir}")
     print("Generated files:")
     print(" - canonical_train_pairs.csv")
-    print(" - sentence_translation_targets.csv")
-    print(" - train_sentence_bridge.csv")
+    print(" - sentence_level_pairs.csv")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
