@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -276,12 +277,39 @@ def run(args: argparse.Namespace) -> None:
     canonical_train_pairs.to_csv(output_dir / "canonical_train_pairs.csv", index=False)
     sentence_level_pairs.to_csv(output_dir / "sentence_level_pairs.csv", index=False)
 
+    summary = {
+        "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "input_dir": str(input_dir),
+        "output_dir": str(output_dir),
+        "valid_ratio": args.valid_ratio,
+        "split_salt": args.split_salt,
+        "canonical_train_pairs_rows": int(len(canonical_train_pairs)),
+        "sentence_level_pairs_rows": int(len(sentence_level_pairs)),
+        "sentence_level_pairs_train_rows": int((sentence_level_pairs["split"] == "train").sum()) if "split" in sentence_level_pairs.columns else 0,
+        "sentence_level_pairs_valid_rows": int((sentence_level_pairs["split"] == "valid").sum()) if "split" in sentence_level_pairs.columns else 0,
+        "first_word_match_rate_percent": float(
+            round((sentence_level_pairs["first_word_match"].astype(int).mean() * 100.0), 2)
+        )
+        if "first_word_match" in sentence_level_pairs.columns and len(sentence_level_pairs) > 0
+        else 0.0,
+        "marker_search_rows": int((sentence_level_pairs["boundary_method"] == "marker_search").sum()) if "boundary_method" in sentence_level_pairs.columns else 0,
+        "first_word_obj_fallback_rows": int((sentence_level_pairs["boundary_method"] == "first_word_obj_fallback").sum()) if "boundary_method" in sentence_level_pairs.columns else 0,
+    }
+
+    summary_path = output_dir / "pipeline_run_history.csv"
+    summary_df = pd.DataFrame([summary])
+    if summary_path.exists():
+        previous = pd.read_csv(summary_path)
+        summary_df = pd.concat([previous, summary_df], ignore_index=True)
+    summary_df.to_csv(summary_path, index=False)
+
     print("Pipelines completed (minimal scope).")
     print(f"Input dir: {input_dir}")
     print(f"Output dir: {output_dir}")
     print("Generated files:")
     print(" - canonical_train_pairs.csv")
     print(" - sentence_level_pairs.csv")
+    print(" - pipeline_run_history.csv")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

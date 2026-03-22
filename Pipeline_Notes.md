@@ -97,6 +97,8 @@ Generated in output directory:
    - document-level normalized pairs
 2. `sentence_level_pairs.csv`
    - sentence-level pairs for seq2seq
+3. `pipeline_run_history.csv`
+   - appended run log (one row per script execution) with timestamp, settings, row counts, and match metrics
 
 Recommended immediate seq2seq training file:
 
@@ -146,6 +148,8 @@ Optional custom paths:
 ```bash
 python data_layer.py --input-dir "<your_input_dir>" --output-dir "<your_output_dir>"
 ```
+
+Each run appends one summary row to `pipeline_run_history.csv`.
 
 ---
 
