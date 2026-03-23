@@ -818,7 +818,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=str, default="")
     parser.add_argument("--max-docs", type=int, default=0, help="0 means all matched docs")
     parser.add_argument("--max-doc-chars", type=int, default=12000)
-    parser.add_argument("--max-completion-tokens", type=int, default=2500)
+    parser.add_argument("--max-completion-tokens", type=int, default=3000)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--retry-sleep-seconds", type=float, default=2.0)
     parser.add_argument("--checkpoint-every", type=int, default=10)
