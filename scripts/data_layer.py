@@ -215,7 +215,10 @@ def build_canonical_train_pairs(train_df: pd.DataFrame, valid_ratio: float, spli
     return out
 
 
-def build_sentence_level_pairs(canonical_train_pairs: pd.DataFrame, sentence_df: pd.DataFrame) -> pd.DataFrame:
+def build_sentence_level_pairs(
+    canonical_train_pairs: pd.DataFrame,
+    sentence_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Pipeline 2: build sentence-level source-target pairs.
 
     Strategy:
@@ -224,15 +227,29 @@ def build_sentence_level_pairs(canonical_train_pairs: pd.DataFrame, sentence_df:
     - slice transliteration_clean token stream between consecutive starts
     - pair sliced source sentence with sentence translation from map file
     """
-    doc_cols = [c for c in ["oare_id", "transliteration", "transliteration_clean", "split"] if c in canonical_train_pairs.columns]
+    doc_cols = [
+        c
+        for c in [
+            "oare_id",
+            "transliteration",
+            "transliteration_clean",
+            "translation",
+            "translation_clean",
+            "split",
+        ]
+        if c in canonical_train_pairs.columns
+    ]
     docs = canonical_train_pairs[doc_cols].copy().rename(columns={"oare_id": "text_uuid", "split": "doc_split"})
 
     work = sentence_df.copy()
     work["translation_clean"] = work["translation"].map(normalize_translation)
     work["first_word_transcription_clean"] = work["first_word_transcription"].map(normalize_transliteration)
     work = work.merge(docs, on="text_uuid", how="inner")
+    work = work.reset_index(drop=True)
+    work["sentence_row_id"] = work.index
 
     rows: list[dict] = []
+    matched_sentence_row_ids: set[int] = set()
     for text_uuid, grp in work.groupby("text_uuid", sort=False):
         grp_sorted = grp.sort_values(["first_word_obj_in_text", "sentence_obj_in_text"], kind="stable").reset_index(drop=True)
 
@@ -295,6 +312,7 @@ def build_sentence_level_pairs(canonical_train_pairs: pd.DataFrame, sentence_df:
 
             rows.append(
                 {
+                    "sentence_row_id": int(getattr(row, "sentence_row_id", -1)),
                     "text_uuid": text_uuid,
                     "sentence_uuid": getattr(row, "sentence_uuid", ""),
                     "sentence_obj_in_text": getattr(row, "sentence_obj_in_text", ""),
@@ -317,7 +335,53 @@ def build_sentence_level_pairs(canonical_train_pairs: pd.DataFrame, sentence_df:
                 }
             )
 
-    return pd.DataFrame(rows)
+            matched_id = int(getattr(row, "sentence_row_id", -1))
+            if matched_id >= 0:
+                matched_sentence_row_ids.add(matched_id)
+
+    sentence_level_pairs = pd.DataFrame(rows)
+
+    expected_counts = work.groupby("text_uuid", as_index=False).size().rename(columns={"size": "expected_sentence_rows"})
+    produced_counts = (
+        sentence_level_pairs.groupby("text_uuid", as_index=False).size().rename(columns={"size": "produced_sentence_rows"})
+        if not sentence_level_pairs.empty
+        else pd.DataFrame(columns=["text_uuid", "produced_sentence_rows"])
+    )
+
+    all_docs = docs[[c for c in ["text_uuid", "doc_split", "transliteration", "transliteration_clean", "translation", "translation_clean"] if c in docs.columns]].drop_duplicates(subset=["text_uuid"])
+
+    coverage = all_docs.merge(expected_counts, on="text_uuid", how="left")
+    coverage = coverage.merge(produced_counts, on="text_uuid", how="left")
+    coverage["expected_sentence_rows"] = coverage["expected_sentence_rows"].fillna(0).astype(int)
+    coverage["produced_sentence_rows"] = coverage["produced_sentence_rows"].fillna(0).astype(int)
+    coverage["unmatched_sentence_rows"] = coverage["expected_sentence_rows"] - coverage["produced_sentence_rows"]
+    coverage["has_sentence_markers"] = (coverage["expected_sentence_rows"] > 0).astype(int)
+    coverage["coverage_percent"] = (
+        (coverage["produced_sentence_rows"] / coverage["expected_sentence_rows"].replace(0, pd.NA)) * 100.0
+    ).fillna(0.0).round(2)
+
+    unmatched_sentence_rows = work[~work["sentence_row_id"].isin(matched_sentence_row_ids)].copy()
+    if not unmatched_sentence_rows.empty:
+        unmatched_sentence_rows["unmatched_reason"] = "alignment_not_generated"
+
+    no_marker_docs = all_docs[~all_docs["text_uuid"].isin(work["text_uuid"].unique())].copy()
+    if not no_marker_docs.empty:
+        no_marker_docs["sentence_row_id"] = pd.NA
+        no_marker_docs["sentence_uuid"] = ""
+        no_marker_docs["sentence_obj_in_text"] = pd.NA
+        no_marker_docs["line_number"] = ""
+        no_marker_docs["first_word_transcription"] = ""
+        no_marker_docs["first_word_obj_in_text"] = pd.NA
+        no_marker_docs["translation_clean_x"] = ""
+        no_marker_docs["first_word_transcription_clean"] = ""
+        no_marker_docs["unmatched_reason"] = "no_sentence_markers"
+
+    unmatched_sentence_pairs = pd.concat([unmatched_sentence_rows, no_marker_docs], ignore_index=True, sort=False)
+
+    coverage = coverage.sort_values(["unmatched_sentence_rows", "expected_sentence_rows"], ascending=[False, False], kind="stable")
+    unmatched_sentence_pairs = unmatched_sentence_pairs.sort_values(["text_uuid", "sentence_obj_in_text"], kind="stable")
+
+    return sentence_level_pairs, coverage, unmatched_sentence_pairs
 
 
 def build_training_ready_sentence_pairs(sentence_level_pairs: pd.DataFrame) -> pd.DataFrame:
@@ -360,12 +424,17 @@ def run(args: argparse.Namespace) -> None:
     sentence_df = pd.read_csv(sentence_path)
 
     canonical_train_pairs = build_canonical_train_pairs(train_df, args.valid_ratio, args.split_salt)
-    sentence_level_pairs = build_sentence_level_pairs(canonical_train_pairs, sentence_df)
+    sentence_level_pairs, sentence_document_coverage, sentence_unmatched_pairs = build_sentence_level_pairs(
+        canonical_train_pairs,
+        sentence_df,
+    )
     sentence_level_pairs_training_ready = build_training_ready_sentence_pairs(sentence_level_pairs)
 
     canonical_train_pairs.to_csv(output_dir / "canonical_train_pairs.csv", index=False)
     sentence_level_pairs.to_csv(output_dir / "sentence_level_pairs.csv", index=False)
     sentence_level_pairs_training_ready.to_csv(output_dir / "sentence_level_pairs_training_ready.csv", index=False)
+    sentence_document_coverage.to_csv(output_dir / "sentence_document_coverage.csv", index=False)
+    sentence_unmatched_pairs.to_csv(output_dir / "sentence_unmatched_pairs.csv", index=False)
 
     summary = {
         "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -376,6 +445,10 @@ def run(args: argparse.Namespace) -> None:
         "canonical_train_pairs_rows": int(len(canonical_train_pairs)),
         "sentence_level_pairs_rows": int(len(sentence_level_pairs)),
         "sentence_level_pairs_training_ready_rows": int(len(sentence_level_pairs_training_ready)),
+        "sentence_unmatched_pairs_rows": int(len(sentence_unmatched_pairs)),
+        "documents_with_unmatched_rows": int((sentence_document_coverage["unmatched_sentence_rows"] > 0).sum())
+        if "unmatched_sentence_rows" in sentence_document_coverage.columns
+        else 0,
         "sentence_level_pairs_train_rows": int((sentence_level_pairs["split"] == "train").sum()) if "split" in sentence_level_pairs.columns else 0,
         "sentence_level_pairs_valid_rows": int((sentence_level_pairs["split"] == "valid").sum()) if "split" in sentence_level_pairs.columns else 0,
         "sentence_level_pairs_training_ready_train_rows": int((sentence_level_pairs_training_ready["split"] == "train").sum()) if "split" in sentence_level_pairs_training_ready.columns else 0,
@@ -405,6 +478,8 @@ def run(args: argparse.Namespace) -> None:
     print(" - canonical_train_pairs.csv")
     print(" - sentence_level_pairs.csv")
     print(" - sentence_level_pairs_training_ready.csv")
+    print(" - sentence_document_coverage.csv")
+    print(" - sentence_unmatched_pairs.csv")
     print(" - pipeline_run_history.csv")
 
 
