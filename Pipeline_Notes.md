@@ -186,3 +186,47 @@ Action for next iteration:
    - fallback-used count
    - dropped-empty or invalid-slice count
 - Improve marker matching and sentence-cut validation.
+
+---
+
+## 12) Publications Expansion (New)
+
+A new stage-1 extractor script exists at `scripts/publications_extractor.py`.
+
+Goal:
+
+- Build deterministic candidate links from `publications.csv` (OCR pages) to tablets in `published_texts.csv`.
+- Prepare LLM-ready rows for stage-2 translation extraction and cleanup.
+
+Current matching (deterministic):
+
+1. Extract CDLI ids (`P######`) from OCR `page_text` and `pdf_name`.
+2. Match those IDs to `published_texts.csv` (`cdli_id` field).
+3. Save candidate rows with confidence scores.
+
+Outputs:
+
+1. `publications_cdli_matches.csv`
+   - deterministic page->tablet matches with confidence and context snippet
+2. `publications_llm_alignment_input.csv`
+   - same matches plus an `llm_task` field for stage-2 extraction prompts
+3. `publications_extraction_summary.csv`
+   - row counts and quick coverage stats
+
+Run command:
+
+```bash
+python publications_extractor.py
+```
+
+Optional quick test on subset:
+
+```bash
+python publications_extractor.py --max-rows 5000
+```
+
+Planned stage-2 (LLM):
+
+- For each deterministic candidate, ask LLM to extract the exact translation segment for that tablet from page text.
+- If translation is not English, convert it to English.
+- Return confidence score and keep only high-confidence outputs as silver training data.
