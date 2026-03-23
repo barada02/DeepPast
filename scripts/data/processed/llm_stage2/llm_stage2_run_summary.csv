@@ -1,2 +1,2 @@
 run_timestamp_utc,input_csv,output_dir,model,base_url,total_input_rows,processed_rows,skipped_rows,parse_fail_rows,silver_rows,silver_unique_oare_ids,rpm,tpm,max_completion_tokens,min_confidence,resume
-2026-03-23T11:19:09.473081+00:00,data\processed\publications_llm_alignment_shortlist.csv,data\processed\llm_stage2,openai-gpt-oss-20b,https://inference.do-ai.run/v1,10,10,0,2,0,0,40,200000,600,0.8,True
+2026-03-23T12:19:41.938558+00:00,data\processed\publications_llm_alignment_shortlist.csv,data\processed\llm_stage2,llama3-8b-instruct,https://inference.do-ai.run/v1,100,100,0,44,136,54,40,200000,1000,0.8,True

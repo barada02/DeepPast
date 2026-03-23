@@ -29,7 +29,7 @@ from openai import OpenAI
 DEFAULT_INPUT_CSV = "data/processed/publications_llm_alignment_shortlist.csv"
 DEFAULT_OUTPUT_DIR = "data/processed/llm_stage2"
 DEFAULT_BASE_URL = "https://inference.do-ai.run/v1"
-DEFAULT_MODEL = "openai-gpt-oss-20b"
+DEFAULT_MODEL = "llama3-8b-instruct" # or "openai-gpt-oss-20b"
 
 JSON_OBJECT_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
 
@@ -139,7 +139,6 @@ def make_input_key(row: pd.Series) -> str:
 def build_prompt(row: pd.Series) -> list[dict[str, str]]:
     transliteration = str(row.get("transliteration", ""))
     page_text = str(row.get("page_text", ""))
-    page_snippet = str(row.get("page_text_snippet", ""))
 
     developer_content = (
         "You are an expert data-alignment assistant for Old Assyrian transliteration and OCR publication text. "
@@ -154,7 +153,6 @@ Given:
 - transliteration: {transliteration}
 - stage1 match source: {row.get('match_source','')}
 - stage1 match confidence: {row.get('match_confidence','')}
-- OCR page snippet: {page_snippet}
 - OCR page text: {page_text}
 
 Tasks:
@@ -163,6 +161,8 @@ Tasks:
 3) If not English, translate to English.
 4) Split into sentence-level pairs when possible.
 5) Return confidence and short evidence.
+6) Return your brief opinion about page usefulness.
+7) Return any Akkadian/transliteration-like sentence fragments seen in page text.
 
 Return strict JSON with this schema:
 {{
@@ -174,6 +174,8 @@ Return strict JSON with this schema:
   "confidence": 0.0,
   "translation_extracted": "...",
   "translation_english": "...",
+    "llm_opinion": "...",
+    "akkadian_from_page_text": ["..."],
   "pairs": [
     {{"source_sentence": "...", "target_sentence_english": "..."}}
   ],
@@ -188,6 +190,8 @@ If not reliable, return:
   "source_pdf": "...",
   "source_page": "...",
   "confidence": 0.0,
+    "llm_opinion": "...",
+    "akkadian_from_page_text": [],
   "evidence": "...",
   "notes": "..."
 }}
@@ -259,6 +263,11 @@ def flatten_silver_pairs(df_input: pd.DataFrame, raw_jsonl_path: Path, min_conf:
                     target_sentence = str(pair.get("target_sentence_english", "")).strip()
                     if not target_sentence:
                         continue
+                    akkadian_fragments = parsed.get("akkadian_from_page_text", [])
+                    if isinstance(akkadian_fragments, list):
+                        akkadian_fragments_text = " | ".join(str(x) for x in akkadian_fragments[:10])
+                    else:
+                        akkadian_fragments_text = str(akkadian_fragments)
                     out_rows.append(
                         {
                             "oare_id": stage1.get("oare_id", ""),
@@ -270,6 +279,8 @@ def flatten_silver_pairs(df_input: pd.DataFrame, raw_jsonl_path: Path, min_conf:
                             "stage1_match_confidence": stage1.get("match_confidence", ""),
                             "stage2_confidence": conf,
                             "language_detected": parsed.get("language_detected", "other"),
+                            "llm_opinion": parsed.get("llm_opinion", ""),
+                            "akkadian_from_page_text": akkadian_fragments_text,
                             "evidence": parsed.get("evidence", ""),
                             "notes": parsed.get("notes", ""),
                             "pair_index": i,
@@ -279,6 +290,11 @@ def flatten_silver_pairs(df_input: pd.DataFrame, raw_jsonl_path: Path, min_conf:
             else:
                 fallback_target = str(parsed.get("translation_english", "")).strip()
                 if fallback_target:
+                    akkadian_fragments = parsed.get("akkadian_from_page_text", [])
+                    if isinstance(akkadian_fragments, list):
+                        akkadian_fragments_text = " | ".join(str(x) for x in akkadian_fragments[:10])
+                    else:
+                        akkadian_fragments_text = str(akkadian_fragments)
                     out_rows.append(
                         {
                             "oare_id": stage1.get("oare_id", ""),
@@ -290,6 +306,8 @@ def flatten_silver_pairs(df_input: pd.DataFrame, raw_jsonl_path: Path, min_conf:
                             "stage1_match_confidence": stage1.get("match_confidence", ""),
                             "stage2_confidence": conf,
                             "language_detected": parsed.get("language_detected", "other"),
+                            "llm_opinion": parsed.get("llm_opinion", ""),
+                            "akkadian_from_page_text": akkadian_fragments_text,
                             "evidence": parsed.get("evidence", ""),
                             "notes": parsed.get("notes", ""),
                             "pair_index": 0,
@@ -329,7 +347,7 @@ def run(args: argparse.Namespace) -> None:
     if args.max_rows > 0:
         df = df.head(args.max_rows).copy()
 
-    required_cols = ["oare_id", "pdf_name", "page", "transliteration", "page_text", "page_text_snippet"]
+    required_cols = ["oare_id", "pdf_name", "page", "transliteration", "page_text"]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError(f"Input CSV missing required columns: {missing}")
@@ -461,7 +479,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Model name")
 
     parser.add_argument("--temperature", type=float, default=0.0, help="Generation temperature")
-    parser.add_argument("--max-completion-tokens", type=int, default=600, help="Max completion tokens")
+    parser.add_argument("--max-completion-tokens", type=int, default=1000, help="Max completion tokens")
 
     parser.add_argument("--rpm", type=int, default=40, help="Requests per minute limit (0 to disable)")
     parser.add_argument("--tpm", type=int, default=200000, help="Tokens per minute limit (0 to disable)")
