@@ -29,7 +29,7 @@ from openai import OpenAI
 DEFAULT_INPUT_CSV = "data/processed/publications_llm_alignment_shortlist.csv"
 DEFAULT_OUTPUT_DIR = "data/processed/llm_stage2"
 DEFAULT_BASE_URL = "https://inference.do-ai.run/v1"
-DEFAULT_MODEL = "gpt-oss-20b"
+DEFAULT_MODEL = "openai-gpt-oss-20b"
 
 JSON_OBJECT_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
 
