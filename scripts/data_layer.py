@@ -97,8 +97,75 @@ def normalize_token_for_match(token: str) -> str:
     """Normalize a single token for boundary matching checks."""
     value = normalize_transliteration(token)
     value = value.lower()
-    value = re.sub(r"[^a-z0-9šṣṭḫ\-]", "", value)
+    value = re.sub(r"[^a-z0-9šṣṭh\-]", "", value)
     return value
+
+
+def _compact_token_for_match(token: str) -> str:
+    """Compact token form used for robust matching (drop hyphens)."""
+    return normalize_token_for_match(token).replace("-", "")
+
+
+def _find_marker_index(marker: str, token_norm: list[str], token_compact: list[str], cursor: int) -> int | None:
+    """Find best marker index in token sequence from cursor onward."""
+    if not marker:
+        return None
+
+    marker_compact = marker.replace("-", "")
+
+    for j in range(max(0, cursor), len(token_norm)):
+        token = token_norm[j]
+        token_c = token_compact[j]
+
+        if token == marker or token.startswith(marker) or marker.startswith(token):
+            return j
+
+        if marker_compact and (token_c == marker_compact or token_c.startswith(marker_compact) or marker_compact.startswith(token_c)):
+            return j
+
+    return None
+
+
+def _coerce_word_start_index(value: object, doc_len: int) -> int | None:
+    """Convert 1-based word index to bounded 0-based token index."""
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return None
+    idx = int(numeric) - 1
+    if idx < 0:
+        return None
+    if doc_len <= 0:
+        return None
+    return min(idx, doc_len - 1)
+
+
+def _proportional_start_index(position: int, total: int, doc_len: int) -> int:
+    """Fallback start index based on relative sentence position in document."""
+    if doc_len <= 1 or total <= 1:
+        return 0
+    ratio = float(position) / float(max(1, total - 1))
+    return int(round(ratio * (doc_len - 1)))
+
+
+def _repair_monotonic_starts(starts: list[int], doc_len: int) -> list[int]:
+    """Repair start indices to be non-decreasing and bounded to token range."""
+    if not starts:
+        return starts
+    if doc_len <= 0:
+        return [0 for _ in starts]
+
+    repaired: list[int] = []
+    prev = 0
+    for i, start in enumerate(starts):
+        value = int(start)
+        if i == 0:
+            value = max(0, min(value, doc_len - 1))
+        else:
+            value = max(prev, min(value, doc_len - 1))
+        repaired.append(value)
+        prev = value
+
+    return repaired
 
 
 def deterministic_split_by_id(
@@ -176,46 +243,43 @@ def build_sentence_level_pairs(canonical_train_pairs: pd.DataFrame, sentence_df:
             continue
 
         doc_tokens_norm = [normalize_token_for_match(token) for token in doc_tokens_raw]
+        doc_tokens_compact = [_compact_token_for_match(token) for token in doc_tokens_raw]
         search_cursor = 0
-        starts: list[int] = []
+        starts_raw: list[int] = []
         start_method: list[str] = []
 
-        for row in grp_sorted.itertuples(index=False):
+        total_sentences = len(grp_sorted)
+        for i, row in enumerate(grp_sorted.itertuples(index=False)):
             marker = normalize_token_for_match(getattr(row, "first_word_transcription_clean", ""))
-            found_idx = None
+            found_idx = _find_marker_index(marker, doc_tokens_norm, doc_tokens_compact, search_cursor)
 
-            if marker:
-                for j in range(search_cursor, len(doc_tokens_norm)):
-                    token_norm = doc_tokens_norm[j]
-                    if token_norm == marker or token_norm.startswith(marker) or marker.startswith(token_norm):
-                        found_idx = j
-                        break
-
-            if found_idx is None:
-                fallback = pd.to_numeric(getattr(row, "first_word_obj_in_text", None), errors="coerce")
-                if pd.notna(fallback):
-                    fallback_idx = int(fallback) - 1
-                    if 0 <= fallback_idx < len(doc_tokens_norm):
-                        found_idx = fallback_idx
-                        start_method.append("first_word_obj_fallback")
-
-            if found_idx is None:
+            if found_idx is not None:
+                starts_raw.append(found_idx)
+                start_method.append("marker_search")
+                search_cursor = max(search_cursor, found_idx)
                 continue
 
-            starts.append(found_idx + 1)
-            if len(start_method) < len(starts):
-                start_method.append("marker_search")
-            search_cursor = max(search_cursor, found_idx)
+            fallback_idx = _coerce_word_start_index(getattr(row, "first_word_obj_in_text", None), len(doc_tokens_norm))
+            if fallback_idx is not None:
+                starts_raw.append(fallback_idx)
+                start_method.append("first_word_obj_fallback")
+                search_cursor = max(search_cursor, fallback_idx)
+                continue
 
-        if not starts:
-            continue
+            proportional_idx = _proportional_start_index(i, total_sentences, len(doc_tokens_norm))
+            starts_raw.append(proportional_idx)
+            start_method.append("proportional_fallback")
+            search_cursor = max(search_cursor, proportional_idx)
 
-        if len(starts) != len(grp_sorted):
-            grp_sorted = grp_sorted.iloc[: len(starts)].copy().reset_index(drop=True)
+        starts = _repair_monotonic_starts(starts_raw, len(doc_tokens_for_bounds))
 
         for i, row in enumerate(grp_sorted.itertuples(index=False)):
-            start_idx = starts[i] - 1
-            end_idx = starts[i + 1] - 1 if i + 1 < len(starts) else len(doc_tokens_for_bounds)
+            start_idx = starts[i]
+            end_idx = starts[i + 1] if i + 1 < len(starts) else len(doc_tokens_for_bounds)
+
+            if end_idx <= start_idx:
+                end_idx = min(len(doc_tokens_for_bounds), start_idx + 1)
+
             if start_idx >= end_idx:
                 continue
 
@@ -240,8 +304,10 @@ def build_sentence_level_pairs(canonical_train_pairs: pd.DataFrame, sentence_df:
                     "target_sentence": getattr(row, "translation", ""),
                     "target_sentence_clean": getattr(row, "translation_clean", ""),
                     "source_start_word_idx": start_idx + 1,
-                    "source_end_word_idx_exclusive": end_idx + 1,
+                    "source_end_word_idx_exclusive": end_idx,
                     "boundary_method": start_method[i],
+                    "source_start_word_idx_raw": starts_raw[i] + 1,
+                    "source_start_idx_repaired": int(starts[i] != starts_raw[i]),
                     "first_word_transcription": getattr(row, "first_word_transcription", ""),
                     "first_word_transcription_clean": getattr(row, "first_word_transcription_clean", ""),
                     "first_word_match": marker_match,
@@ -252,6 +318,28 @@ def build_sentence_level_pairs(canonical_train_pairs: pd.DataFrame, sentence_df:
             )
 
     return pd.DataFrame(rows)
+
+
+def build_training_ready_sentence_pairs(sentence_level_pairs: pd.DataFrame) -> pd.DataFrame:
+    """Normalize sentence-pair outputs end-to-end and keep training-ready rows."""
+    if sentence_level_pairs.empty:
+        return sentence_level_pairs.copy()
+
+    out = sentence_level_pairs.copy()
+    out["source_sentence_clean"] = out["source_sentence_raw"].map(normalize_transliteration)
+    out["target_sentence_clean"] = out["target_sentence"].map(normalize_translation)
+    out["source_sentence_clean"] = out["source_sentence_clean"].fillna("").astype(str).map(lambda x: re.sub(r"\s+", " ", x).strip())
+    out["target_sentence_clean"] = out["target_sentence_clean"].fillna("").astype(str).map(lambda x: re.sub(r"\s+", " ", x).strip())
+
+    out["source_token_count"] = out["source_sentence_clean"].map(lambda x: len(x.split()))
+    out["target_token_count"] = out["target_sentence_clean"].map(lambda x: len(x.split()))
+    out["is_training_ready"] = (
+        (out["source_token_count"] > 0)
+        & (out["target_token_count"] > 0)
+    ).astype(int)
+
+    out = out[out["is_training_ready"] == 1].copy().reset_index(drop=True)
+    return out
 
 
 def run(args: argparse.Namespace) -> None:
@@ -273,9 +361,11 @@ def run(args: argparse.Namespace) -> None:
 
     canonical_train_pairs = build_canonical_train_pairs(train_df, args.valid_ratio, args.split_salt)
     sentence_level_pairs = build_sentence_level_pairs(canonical_train_pairs, sentence_df)
+    sentence_level_pairs_training_ready = build_training_ready_sentence_pairs(sentence_level_pairs)
 
     canonical_train_pairs.to_csv(output_dir / "canonical_train_pairs.csv", index=False)
     sentence_level_pairs.to_csv(output_dir / "sentence_level_pairs.csv", index=False)
+    sentence_level_pairs_training_ready.to_csv(output_dir / "sentence_level_pairs_training_ready.csv", index=False)
 
     summary = {
         "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -285,8 +375,11 @@ def run(args: argparse.Namespace) -> None:
         "split_salt": args.split_salt,
         "canonical_train_pairs_rows": int(len(canonical_train_pairs)),
         "sentence_level_pairs_rows": int(len(sentence_level_pairs)),
+        "sentence_level_pairs_training_ready_rows": int(len(sentence_level_pairs_training_ready)),
         "sentence_level_pairs_train_rows": int((sentence_level_pairs["split"] == "train").sum()) if "split" in sentence_level_pairs.columns else 0,
         "sentence_level_pairs_valid_rows": int((sentence_level_pairs["split"] == "valid").sum()) if "split" in sentence_level_pairs.columns else 0,
+        "sentence_level_pairs_training_ready_train_rows": int((sentence_level_pairs_training_ready["split"] == "train").sum()) if "split" in sentence_level_pairs_training_ready.columns else 0,
+        "sentence_level_pairs_training_ready_valid_rows": int((sentence_level_pairs_training_ready["split"] == "valid").sum()) if "split" in sentence_level_pairs_training_ready.columns else 0,
         "first_word_match_rate_percent": float(
             round((sentence_level_pairs["first_word_match"].astype(int).mean() * 100.0), 2)
         )
@@ -294,6 +387,8 @@ def run(args: argparse.Namespace) -> None:
         else 0.0,
         "marker_search_rows": int((sentence_level_pairs["boundary_method"] == "marker_search").sum()) if "boundary_method" in sentence_level_pairs.columns else 0,
         "first_word_obj_fallback_rows": int((sentence_level_pairs["boundary_method"] == "first_word_obj_fallback").sum()) if "boundary_method" in sentence_level_pairs.columns else 0,
+        "proportional_fallback_rows": int((sentence_level_pairs["boundary_method"] == "proportional_fallback").sum()) if "boundary_method" in sentence_level_pairs.columns else 0,
+        "source_start_idx_repaired_rows": int(sentence_level_pairs["source_start_idx_repaired"].astype(int).sum()) if "source_start_idx_repaired" in sentence_level_pairs.columns else 0,
     }
 
     summary_path = output_dir / "pipeline_run_history.csv"
@@ -309,6 +404,7 @@ def run(args: argparse.Namespace) -> None:
     print("Generated files:")
     print(" - canonical_train_pairs.csv")
     print(" - sentence_level_pairs.csv")
+    print(" - sentence_level_pairs_training_ready.csv")
     print(" - pipeline_run_history.csv")
 
 

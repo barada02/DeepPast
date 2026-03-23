@@ -73,19 +73,24 @@ For overlapping documents (`text_uuid == oare_id`):
 1. Sort sentence markers by:
    - `first_word_obj_in_text`
    - `sentence_obj_in_text`
-2. Try to locate sentence starts via **marker search**:
-   - compare normalized `first_word_transcription` with normalized document tokens
+2. Try to locate sentence starts via **robust marker search**:
+   - compare normalized marker token with normalized document tokens
+   - also compare compact forms (hyphen-insensitive)
    - search sequentially through document token stream
 3. If marker search fails, fallback to:
-   - `first_word_obj_in_text` (word-index based boundary)
-4. Slice document transliteration between consecutive boundaries.
-5. Normalize sliced source sentence.
-6. Pair with sentence translation from sentence map.
+   - `first_word_obj_in_text` (word-index boundary)
+4. If index fallback is missing, fallback to:
+   - proportional boundary estimate by sentence position in document
+5. Repair boundaries to monotonic, bounded start indices.
+6. Slice document transliteration between consecutive boundaries.
+7. Normalize sliced source sentence.
+8. Pair with sentence translation from sentence map.
 
 Quality helper columns are written for analysis:
 
 - `first_word_match`
-- `boundary_method` (`marker_search` or `first_word_obj_fallback`)
+- `boundary_method` (`marker_search`, `first_word_obj_fallback`, `proportional_fallback`)
+- `source_start_idx_repaired` (whether start index was adjusted during monotonic repair)
 
 ---
 
@@ -97,12 +102,14 @@ Generated in output directory:
    - document-level normalized pairs
 2. `sentence_level_pairs.csv`
    - sentence-level pairs for seq2seq
-3. `pipeline_run_history.csv`
+3. `sentence_level_pairs_training_ready.csv`
+   - sentence-level pairs after full post-alignment normalization and non-empty filtering
+4. `pipeline_run_history.csv`
    - appended run log (one row per script execution) with timestamp, settings, row counts, and match metrics
 
 Recommended immediate seq2seq training file:
 
-- **`sentence_level_pairs.csv`**
+- **`sentence_level_pairs_training_ready.csv`**
   - source: `source_sentence_clean`
   - target: `target_sentence_clean`
 
@@ -165,7 +172,8 @@ Each run appends one summary row to `pipeline_run_history.csv`.
 Current observed issue:
 
 - Source document-level dataset size is **1561** rows.
-- Current generated sentence-level pairs are **396** rows.
+- Earlier generated sentence-level pairs were **396** rows (before alignment refactor).
+- Current generated sentence-level pairs are substantially higher after robust fallback + boundary repair.
 
 Why this is a problem:
 
@@ -184,6 +192,8 @@ Action for next iteration:
    - overlap docs count
    - marker-found count
    - fallback-used count
+   - proportional-fallback count
+   - repaired-boundary count
    - dropped-empty or invalid-slice count
 - Improve marker matching and sentence-cut validation.
 
