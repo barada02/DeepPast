@@ -157,3 +157,32 @@ Each run appends one summary row to `pipeline_run_history.csv`.
 
 - If you want **safe first training**: use rows where `first_word_match == 1` and `boundary_method == marker_search`.
 - If you want **more data quickly**: use full `sentence_level_pairs.csv`.
+
+---
+
+## 11) Open Problem To Revisit
+
+Current observed issue:
+
+- Source document-level dataset size is **1561** rows.
+- Current generated sentence-level pairs are **396** rows.
+
+Why this is a problem:
+
+- A full document->sentence conversion should usually produce **more** rows than document-level input.
+- Current sentence output is a conservative subset, not full coverage.
+
+Likely causes:
+
+1. Limited overlap between `train.csv` ids and sentence-map ids.
+2. Boundary matching misses due to token normalization/scribal notation differences.
+3. Fallback boundaries may not always produce valid cuts.
+
+Action for next iteration:
+
+- Add stage-by-stage coverage report:
+   - overlap docs count
+   - marker-found count
+   - fallback-used count
+   - dropped-empty or invalid-slice count
+- Improve marker matching and sentence-cut validation.
