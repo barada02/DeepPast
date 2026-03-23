@@ -241,3 +241,39 @@ Current full-run snapshot (with `has_akkadian=true` filter):
 Stage-2 template file:
 
 - `scripts/llm_stage2_prompt_template.md`
+
+Stage-2 runner script:
+
+- `scripts/stage2_llm_runner.py`
+
+Required env:
+
+- `DO_AI_API_KEY` in `.env` (see `.env.example`)
+
+Stage-2 outputs:
+
+1. `data/processed/llm_stage2/llm_raw_responses.jsonl`
+   - raw API outputs + parsed JSON + token usage + errors
+2. `data/processed/llm_stage2/silver_sentence_pairs.csv`
+   - one-to-many flattened sentence pairs
+3. `data/processed/llm_stage2/llm_stage2_run_summary.csv`
+   - run-level metrics
+
+Run command (small test first):
+
+```bash
+python stage2_llm_runner.py --max-rows 20 --rpm 10 --tpm 50000
+```
+
+Full run:
+
+```bash
+python stage2_llm_runner.py --rpm 40 --tpm 200000
+```
+
+Cost/rate guidance:
+
+- Start with low `--max-rows` for prompt validation.
+- Keep `temperature=0` for stable JSON output.
+- Use `--resume` (default true) to avoid re-paying for already processed rows.
+- Tune `--rpm` and `--tpm` based on provider limits.
