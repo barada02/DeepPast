@@ -163,6 +163,8 @@ def build_prompt_payload(
             "Do NOT hallucinate facts, words, or meanings not present in provided text.",
             "Do NOT add commentary outside JSON.",
             "Use only material from the given transliteration/translation.",
+            "source_sentence and target_sentence must be exact substrings copied from the provided document text.",
+            "Do not rewrite, paraphrase, normalize, or fix spelling in extracted sentences.",
             "If clue coverage is incomplete, infer additional sentence boundaries conservatively to maximize coverage.",
             "If uncertain, still provide best local alignment with lower confidence instead of inventing content.",
             "Keep source/target language as provided: source Akkadian transliteration, target English translation.",
@@ -181,6 +183,171 @@ def build_prompt_payload(
         },
     }
     return json.dumps(payload, ensure_ascii=False)
+
+
+def build_second_pass_payload(
+    oare_id: str,
+    leftover_source_text: str,
+    leftover_target_text: str,
+    existing_pairs: list[dict[str, Any]],
+) -> str:
+    schema = {
+        "oare_id": "string",
+        "pairs": [
+            {
+                "source_sentence": "string",
+                "target_sentence": "string",
+                "source_method": "leftover_inferred",
+                "target_method": "leftover_inferred",
+                "confidence": 0.0,
+                "note": "string",
+            }
+        ],
+        "leftover_source_text": "string",
+        "leftover_target_text": "string",
+    }
+
+    instructions = {
+        "task": "Second-pass alignment over leftovers only.",
+        "hard_rules": [
+            "Do NOT hallucinate.",
+            "Return strict JSON only.",
+            "Extract source/target as exact substrings from the leftover texts.",
+            "Do not duplicate any existing aligned pair.",
+            "Do not rewrite or paraphrase.",
+        ],
+        "goal": "Recover additional valid sentence pairs from leftovers.",
+        "output_json_schema": schema,
+    }
+
+    payload = {
+        "instructions": instructions,
+        "document": {
+            "oare_id": oare_id,
+            "leftover_source_text": leftover_source_text,
+            "leftover_target_text": leftover_target_text,
+            "existing_pairs": existing_pairs,
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _contains_exact_substring(container_text: str, candidate: str) -> bool:
+    if not candidate:
+        return False
+    return candidate in container_text
+
+
+def _find_position(container_text: str, candidate: str, start_pos: int = 0) -> int:
+    if not candidate:
+        return -1
+    return container_text.find(candidate, max(0, start_pos))
+
+
+def _token_set(text: str) -> set[str]:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not cleaned:
+        return set()
+    return set(cleaned.split())
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    if union == 0:
+        return 0.0
+    return inter / union
+
+
+def validate_aligned_pairs(
+    pairs: list[dict[str, Any]],
+    doc_transliteration: str,
+    doc_translation: str,
+    existing_pair_keys: set[tuple[str, str]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    """Validate LLM output pairs with strict checks for training safety."""
+    accepted: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+
+    pair_keys = set(existing_pair_keys or set())
+    last_src_pos = -1
+    last_tgt_pos = -1
+    last_src_tokens: set[str] = set()
+
+    stats = {
+        "input_pairs": len(pairs),
+        "accepted_pairs": 0,
+        "rejected_empty": 0,
+        "rejected_not_substring": 0,
+        "rejected_duplicate": 0,
+        "rejected_order": 0,
+        "rejected_overlap": 0,
+    }
+
+    for idx, pair in enumerate(pairs, start=1):
+        if not isinstance(pair, dict):
+            issues.append({"pair_index": idx, "reason": "not_dict"})
+            continue
+
+        src_raw = clean_text(pair.get("source_sentence", ""))
+        tgt_raw = clean_text(pair.get("target_sentence", ""))
+        if not src_raw or not tgt_raw:
+            stats["rejected_empty"] += 1
+            issues.append({"pair_index": idx, "reason": "empty_source_or_target"})
+            continue
+
+        if not _contains_exact_substring(doc_transliteration, src_raw) or not _contains_exact_substring(doc_translation, tgt_raw):
+            stats["rejected_not_substring"] += 1
+            issues.append({"pair_index": idx, "reason": "not_exact_substring", "source": src_raw, "target": tgt_raw})
+            continue
+
+        pair_key = (src_raw, tgt_raw)
+        if pair_key in pair_keys:
+            stats["rejected_duplicate"] += 1
+            issues.append({"pair_index": idx, "reason": "duplicate_pair", "source": src_raw, "target": tgt_raw})
+            continue
+
+        src_pos = _find_position(doc_transliteration, src_raw, last_src_pos + 1)
+        tgt_pos = _find_position(doc_translation, tgt_raw, last_tgt_pos + 1)
+        if src_pos == -1 or tgt_pos == -1:
+            stats["rejected_order"] += 1
+            issues.append({"pair_index": idx, "reason": "order_position_not_found", "source": src_raw, "target": tgt_raw})
+            continue
+
+        if src_pos < last_src_pos or tgt_pos < last_tgt_pos:
+            stats["rejected_order"] += 1
+            issues.append({"pair_index": idx, "reason": "non_monotonic_order", "source": src_raw, "target": tgt_raw})
+            continue
+
+        src_tokens = _token_set(src_raw)
+        if last_src_tokens and _jaccard(src_tokens, last_src_tokens) >= 0.95:
+            stats["rejected_overlap"] += 1
+            issues.append({"pair_index": idx, "reason": "near_duplicate_overlap", "source": src_raw, "target": tgt_raw})
+            continue
+
+        accepted.append(
+            {
+                "pair_index": idx,
+                "source_sentence_raw": src_raw,
+                "target_sentence_raw": tgt_raw,
+                "source_method": clean_text(pair.get("source_method", "")) or "inferred",
+                "target_method": clean_text(pair.get("target_method", "")) or "inferred",
+                "alignment_confidence": pair.get("confidence", None),
+                "alignment_note": clean_text(pair.get("note", "")),
+                "source_pos": src_pos,
+                "target_pos": tgt_pos,
+            }
+        )
+
+        pair_keys.add(pair_key)
+        last_src_pos = src_pos
+        last_tgt_pos = tgt_pos
+        last_src_tokens = src_tokens
+
+    stats["accepted_pairs"] = len(accepted)
+    return accepted, issues, stats
 
 
 def call_alignment_llm(
@@ -300,6 +467,8 @@ def run(args: argparse.Namespace) -> int:
     doc_status_path = output_dir / "alignment_document_status.csv"
     raw_jsonl_path = output_dir / "alignment_raw_responses.jsonl"
     dataset_path = output_dir / "train_dataset_sl_clean.csv"
+    leftover_debug_path = output_dir / "alignment_leftovers_debug.csv"
+    validation_issues_path = output_dir / "alignment_validation_issues.csv"
 
     existing_status_df = pd.DataFrame()
     processed_completed_ids: set[str] = set()
@@ -323,6 +492,8 @@ def run(args: argparse.Namespace) -> int:
 
     result_rows: list[dict[str, Any]] = []
     status_rows: list[dict[str, Any]] = []
+    leftover_debug_rows: list[dict[str, Any]] = []
+    validation_issue_rows: list[dict[str, Any]] = []
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     log(f"Starting LLM alignment run_id={run_id} | model={model} | base_url={base_url}")
@@ -427,34 +598,133 @@ def run(args: argparse.Namespace) -> int:
             continue
 
         pairs = parsed.get("pairs", []) if isinstance(parsed, dict) else []
+
+        accepted_pairs, pair_issues, pair_stats = validate_aligned_pairs(
+            pairs=pairs,
+            doc_transliteration=doc_transliteration,
+            doc_translation=doc_translation,
+        )
+
+        for issue in pair_issues:
+            validation_issue_rows.append(
+                {
+                    "run_id": run_id,
+                    "oare_id": doc_id,
+                    "pass": "first_pass",
+                    **issue,
+                }
+            )
+
         produced = 0
-
-        for pair_idx, pair in enumerate(pairs, start=1):
-            if not isinstance(pair, dict):
-                continue
-            src_raw = clean_text(pair.get("source_sentence", ""))
-            tgt_raw = clean_text(pair.get("target_sentence", ""))
-            if not src_raw or not tgt_raw:
-                continue
-
+        existing_pair_keys = set()
+        for accepted in accepted_pairs:
+            src_raw = accepted["source_sentence_raw"]
+            tgt_raw = accepted["target_sentence_raw"]
+            existing_pair_keys.add((src_raw, tgt_raw))
             result_rows.append(
                 {
                     "oare_id": doc_id,
-                    "pair_index": pair_idx,
+                    "pair_index": accepted["pair_index"],
+                    "alignment_pass": "first_pass",
                     "source_sentence_raw": src_raw,
                     "target_sentence_raw": tgt_raw,
                     "source_sentence_clean": normalize_transliteration(src_raw),
                     "target_sentence_clean": normalize_translation(tgt_raw),
-                    "source_method": clean_text(pair.get("source_method", "")) or "inferred",
-                    "target_method": clean_text(pair.get("target_method", "")) or "inferred",
-                    "alignment_confidence": pair.get("confidence", None),
-                    "alignment_note": clean_text(pair.get("note", "")),
+                    "source_method": accepted["source_method"],
+                    "target_method": accepted["target_method"],
+                    "alignment_confidence": accepted["alignment_confidence"],
+                    "alignment_note": accepted["alignment_note"],
+                    "source_pos": accepted["source_pos"],
+                    "target_pos": accepted["target_pos"],
                     "doc_translation": doc_translation,
                     "doc_transliteration": doc_transliteration,
                     "run_id": run_id,
                 }
             )
             produced += 1
+
+        leftover_source = clean_text(parsed.get("leftover_source_text", ""))
+        leftover_target = clean_text(parsed.get("leftover_target_text", ""))
+
+        second_pass_added = 0
+        second_pass_error = ""
+        if leftover_source and leftover_target and args.enable_second_pass:
+            second_payload = build_second_pass_payload(
+                oare_id=doc_id,
+                leftover_source_text=leftover_source,
+                leftover_target_text=leftover_target,
+                existing_pairs=[{"source_sentence": src, "target_sentence": tgt} for src, tgt in existing_pair_keys],
+            )
+            parsed_second, raw_content_second, second_pass_error = call_alignment_llm(
+                client=client,
+                model=model,
+                prompt_payload=second_payload,
+                max_completion_tokens=args.max_completion_tokens,
+                retries=args.retries,
+                sleep_seconds=args.retry_sleep_seconds,
+            )
+
+            raw_handle.write(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "oare_id": doc_id,
+                        "raw_response": raw_content_second,
+                        "parse_ok": parsed_second is not None,
+                        "error": second_pass_error,
+                        "pass": "second_pass",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            raw_handle.flush()
+
+            if parsed_second is not None:
+                pairs_second = parsed_second.get("pairs", []) if isinstance(parsed_second, dict) else []
+                accepted_second, issues_second, _ = validate_aligned_pairs(
+                    pairs=pairs_second,
+                    doc_transliteration=doc_transliteration,
+                    doc_translation=doc_translation,
+                    existing_pair_keys=existing_pair_keys,
+                )
+
+                for issue in issues_second:
+                    validation_issue_rows.append(
+                        {
+                            "run_id": run_id,
+                            "oare_id": doc_id,
+                            "pass": "second_pass",
+                            **issue,
+                        }
+                    )
+
+                for accepted in accepted_second:
+                    src_raw = accepted["source_sentence_raw"]
+                    tgt_raw = accepted["target_sentence_raw"]
+                    result_rows.append(
+                        {
+                            "oare_id": doc_id,
+                            "pair_index": int(accepted["pair_index"]),
+                            "alignment_pass": "second_pass",
+                            "source_sentence_raw": src_raw,
+                            "target_sentence_raw": tgt_raw,
+                            "source_sentence_clean": normalize_transliteration(src_raw),
+                            "target_sentence_clean": normalize_translation(tgt_raw),
+                            "source_method": accepted["source_method"] or "leftover_inferred",
+                            "target_method": accepted["target_method"] or "leftover_inferred",
+                            "alignment_confidence": accepted["alignment_confidence"],
+                            "alignment_note": accepted["alignment_note"],
+                            "source_pos": accepted["source_pos"],
+                            "target_pos": accepted["target_pos"],
+                            "doc_translation": doc_translation,
+                            "doc_transliteration": doc_transliteration,
+                            "run_id": run_id,
+                        }
+                    )
+                    second_pass_added += 1
+                    produced += 1
 
         status_rows.append(
             {
@@ -465,8 +735,28 @@ def run(args: argparse.Namespace) -> int:
                 "reason": "ok",
                 "expected_clue_rows": len(clue_rows),
                 "produced_pairs": produced,
-                "leftover_source_text": clean_text(parsed.get("leftover_source_text", "")),
-                "leftover_target_text": clean_text(parsed.get("leftover_target_text", "")),
+                "accepted_first_pass_pairs": pair_stats["accepted_pairs"],
+                "rejected_not_substring": pair_stats["rejected_not_substring"],
+                "rejected_duplicate": pair_stats["rejected_duplicate"],
+                "rejected_order": pair_stats["rejected_order"],
+                "rejected_overlap": pair_stats["rejected_overlap"],
+                "second_pass_added_pairs": second_pass_added,
+                "second_pass_error": second_pass_error,
+                "leftover_source_text": leftover_source,
+                "leftover_target_text": leftover_target,
+            }
+        )
+
+        leftover_debug_rows.append(
+            {
+                "run_id": run_id,
+                "oare_id": doc_id,
+                "leftover_source_text": leftover_source,
+                "leftover_target_text": leftover_target,
+                "leftover_source_chars": len(leftover_source),
+                "leftover_target_chars": len(leftover_target),
+                "first_pass_accepted_pairs": pair_stats["accepted_pairs"],
+                "second_pass_added_pairs": second_pass_added,
             }
         )
 
@@ -485,6 +775,9 @@ def run(args: argparse.Namespace) -> int:
                 merged = new_status_df_ckpt
             save_csv(merged, doc_status_path)
 
+            save_csv(pd.DataFrame(leftover_debug_rows), leftover_debug_path)
+            save_csv(pd.DataFrame(validation_issue_rows), validation_issues_path)
+
     raw_handle.close()
 
     result_df = pd.DataFrame(result_rows)
@@ -501,6 +794,8 @@ def run(args: argparse.Namespace) -> int:
     else:
         final_status_df = new_status_df
     save_csv(final_status_df, doc_status_path)
+    save_csv(pd.DataFrame(leftover_debug_rows), leftover_debug_path)
+    save_csv(pd.DataFrame(validation_issue_rows), validation_issues_path)
 
     completed_count = int((final_status_df["status"] == "completed").sum()) if not final_status_df.empty else 0
     error_count = int((final_status_df["status"] == "llm_error").sum()) if not final_status_df.empty else 0
@@ -509,6 +804,8 @@ def run(args: argparse.Namespace) -> int:
     log(f"Output dataset: {dataset_path} | rows={len(result_df)}")
     log(f"Document status: {doc_status_path} | completed={completed_count} | llm_error={error_count}")
     log(f"Unmatched docs: {unmatched_path} | rows={len(unmatched_df)}")
+    log(f"Leftover debug: {leftover_debug_path}")
+    log(f"Validation issues: {validation_issues_path}")
     log(f"Raw responses: {raw_jsonl_path}")
 
     return 0
@@ -525,6 +822,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--retry-sleep-seconds", type=float, default=2.0)
     parser.add_argument("--checkpoint-every", type=int, default=10)
+    parser.add_argument("--enable-second-pass", action="store_true", default=True)
+    parser.add_argument("--disable-second-pass", dest="enable_second_pass", action="store_false")
     parser.add_argument("--resume", action="store_true", default=True)
     parser.add_argument("--no-resume", dest="resume", action="store_false")
     parser.add_argument("--shuffle", action="store_true", default=False)
