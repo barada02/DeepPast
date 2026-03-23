@@ -230,3 +230,14 @@ Planned stage-2 (LLM):
 - For each deterministic candidate, ask LLM to extract the exact translation segment for that tablet from page text.
 - If translation is not English, convert it to English.
 - Return confidence score and keep only high-confidence outputs as silver training data.
+
+Current full-run snapshot (with `has_akkadian=true` filter):
+
+- `matches_rows`: 4994
+- `unique_oare_ids`: 1312
+- `unique_pdfs`: 198
+- `llm_shortlist_rows`: 4902
+
+Stage-2 template file:
+
+- `scripts/llm_stage2_prompt_template.md`

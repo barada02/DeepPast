@@ -1,2 +1,2 @@
-input_dir,published_texts_rows,publications_max_rows,chunk_size,matches_rows,high_confidence_rows,unique_oare_ids,unique_pdfs
-C:\Users\barad\Desktop\Kaggle\DeepPast\data\deep-past-data,,5000,2500,17,0,13,4
+input_dir,published_texts_rows,publications_max_rows,chunk_size,only_has_akkadian,matches_rows,high_confidence_rows,llm_shortlist_rows,unique_oare_ids,unique_pdfs
+C:\Users\barad\Desktop\Kaggle\DeepPast\data\deep-past-data,,0,2500,True,4994,0,4902,1312,198

@@ -185,6 +185,7 @@ def build_publications_matches(
     ref_lookup: dict[str, list[PublishedRow]],
     chunk_size: int,
     max_rows: int,
+    only_has_akkadian: bool,
 ) -> pd.DataFrame:
     """Create page-to-tablet matches using CDLI ids in OCR pages."""
     out_rows: list[dict] = []
@@ -195,6 +196,11 @@ def build_publications_matches(
             page = getattr(row, "page", "")
             page_text = str(getattr(row, "page_text", ""))
             has_akkadian = getattr(row, "has_akkadian", "")
+
+            if only_has_akkadian:
+                has_akkadian_norm = str(has_akkadian).strip().lower()
+                if has_akkadian_norm != "true":
+                    continue
 
             page_cdli = extract_cdli_ids(page_text)
             name_cdli = extract_cdli_ids(pdf_name)
@@ -320,6 +326,9 @@ def build_llm_input(matches: pd.DataFrame) -> pd.DataFrame:
         return matches.copy()
 
     llm_df = matches.copy()
+    llm_df = llm_df.sort_values(["match_confidence", "match_source"], ascending=[False, True], kind="stable")
+    llm_df = llm_df.drop_duplicates(subset=["pdf_name", "page", "oare_id"], keep="first").reset_index(drop=True)
+    llm_df = llm_df[llm_df["match_confidence"] >= 0.80].copy()
     llm_df["llm_task"] = (
         "Find the translation segment in page_text that corresponds to the given transliteration/tablet; "
         "if translation is not English, translate to English; return a single clean translation text and confidence."
@@ -349,23 +358,28 @@ def run(args: argparse.Namespace) -> None:
         ref_lookup=ref_lookup,
         chunk_size=args.chunk_size,
         max_rows=args.max_rows,
+        only_has_akkadian=args.only_has_akkadian,
     )
     llm_input = build_llm_input(matches)
 
     matches_path = output_dir / "publications_cdli_matches.csv"
     llm_input_path = output_dir / "publications_llm_alignment_input.csv"
+    llm_shortlist_path = output_dir / "publications_llm_alignment_shortlist.csv"
     summary_path = output_dir / "publications_extraction_summary.csv"
 
     matches.to_csv(matches_path, index=False)
     llm_input.to_csv(llm_input_path, index=False)
+    llm_input.to_csv(llm_shortlist_path, index=False)
 
     summary = {
         "input_dir": str(input_dir),
         "published_texts_rows": "",
         "publications_max_rows": args.max_rows,
         "chunk_size": args.chunk_size,
+        "only_has_akkadian": args.only_has_akkadian,
         "matches_rows": int(len(matches)),
         "high_confidence_rows": int((matches["match_confidence"] >= 0.9).sum()) if not matches.empty else 0,
+        "llm_shortlist_rows": int(len(llm_input)),
         "unique_oare_ids": int(matches["oare_id"].nunique()) if not matches.empty else 0,
         "unique_pdfs": int(matches["pdf_name"].nunique()) if not matches.empty else 0,
     }
@@ -377,6 +391,7 @@ def run(args: argparse.Namespace) -> None:
     print("Generated files:")
     print(" - publications_cdli_matches.csv")
     print(" - publications_llm_alignment_input.csv")
+    print(" - publications_llm_alignment_shortlist.csv")
     print(" - publications_extraction_summary.csv")
 
 
@@ -389,6 +404,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--publications-file", type=str, default=DEFAULT_PUBLICATIONS, help="Publications CSV filename")
     parser.add_argument("--chunk-size", type=int, default=2500, help="Chunk size for streaming large publications CSV")
     parser.add_argument("--max-rows", type=int, default=0, help="Limit processed publication rows (0 = all rows)")
+    parser.add_argument("--only-has-akkadian", action="store_true", default=True, help="Process only rows where has_akkadian == true")
     return parser
 
 
